@@ -9,9 +9,33 @@ const {
     ButtonBuilder, 
     ButtonStyle 
 } = require('discord.js');
-const { QuickDB } = require('quick.db');
+const mongoose = require('mongoose');
 
-const db = new QuickDB();
+// ==========================================
+// 1. KONEKSI & SKEMA DATABSE MONGO CLOUD
+// ==========================================
+mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('🍃 [DATABASE] Kredensial Valid. Terhubung ke Cloud MongoDB Atlas!'))
+    .catch(err => console.error('❌ [DATABASE] Gagal terhubung ke Cloud:', err));
+
+// Skema penyimpanan database permanen untuk setiap server Discord
+const ServerConfigSchema = new mongoose.Schema({
+    guildId: { type: String, required: true, unique: true },
+    antilink: { type: Boolean, default: false },
+    antispam: { type: Boolean, default: false },
+    antialt: { type: Number, default: 0 },
+    badwords: { type: [String], default: [] }
+});
+const ServerConfig = mongoose.model('ServerConfig', ServerConfigSchema);
+
+// Helper untuk mengambil atau membuat konfigurasi otomatis di database
+async function getSettings(guildId) {
+    let config = await ServerConfig.findOne({ guildId });
+    if (!config) config = await ServerConfig.create({ guildId });
+    return config;
+}
+
+// Inisialisasi Klien Bot Discord
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -22,18 +46,34 @@ const client = new Client({
     ]
 });
 
-// Cache RAM berkecepatan tinggi
+// Cache RAM berkecepatan tinggi untuk deteksi anomali
 const antiSpamMap = new Map();
 const rateLimitBypass = new Set();
+const joinTracker = []; 
 
-// Helper Kirim Log Rahasia Staff
-async function sendSecurityLog(guild, embed) {
+// Helper Kirim Alert Kasus Mencurigakan ke Channel Khusus Staff
+async function sendSecurityAlert(guild, title, description, severity = 'LOW') {
     const logChannel = guild.channels.cache.get(process.env.LOG_CHANNEL_ID);
-    if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
+    if (!logChannel) return;
+
+    const colorMap = { 'LOW': '#FFAA00', 'MEDIUM': '#FF5500', 'HIGH': '#FF0000' };
+    
+    const alertEmbed = new EmbedBuilder()
+        .setTitle(`🚨 SECURITY ALERT: ${title}`)
+        .setColor(colorMap[severity] || '#FFFFFF')
+        .setDescription(description)
+        .addFields({ name: '🛡️ Status Sistem', value: 'Memantau Aktif 🟢', inline: true })
+        .setTimestamp()
+        .setFooter({ text: 'Sistem Deteksi Anomali Cloud' });
+
+    logChannel.send({ 
+        content: severity === 'HIGH' ? '⚠️ @everyone **TERDETEKSI ANCAMAN SANGAT BERBAHAYA!**' : '', 
+        embeds: [alertEmbed] 
+    }).catch(() => {});
 }
 
 // ==========================================
-// 1. REGISTRASI SEMUA INSTAN SLASH COMMANDS
+// 2. REGISTRASI SEMUA INSTAN SLASH COMMANDS
 // ==========================================
 client.once('ready', async () => {
     console.log(`🛡️ [ENTERPRISE CORE] System Guard Active: ${client.user.tag}`);
@@ -44,7 +84,6 @@ client.once('ready', async () => {
         const commands = guild ? guild.commands : client.application.commands;
 
         await commands.set([
-            // Command Sebelumnya (Optimal & Sinkron)
             {
                 name: 'antilink',
                 description: '🛡️ Mengaktifkan/menonaktifkan filter link global.',
@@ -57,11 +96,11 @@ client.once('ready', async () => {
             },
             {
                 name: 'kata-dilarang',
-                description: '🔤 Mengelola filter kata terlarang.',
+                description: '🔤 Mengelola filter kata terlarang server.',
                 options: [
                     {
                         name: 'tindakan',
-                        description: 'Aksi database',
+                        description: 'Aksi data',
                         type: ApplicationCommandOptionType.String,
                         required: true,
                         choices: [
@@ -105,60 +144,81 @@ client.once('ready', async () => {
                     }
                 ]
             },
-            // --- FITUR BARU PENUNJANG PROFESIONAL ---
             {
                 name: 'setup-verification',
-                description: '🎯 Membuat panel tombol verifikasi otomatis di channel ini (Mencegah Bot Raid).'
+                description: '🎯 Membuat panel tombol verifikasi otomatis di channel ini.'
             },
             {
                 name: 'anti-alt',
-                description: '🤖 Batasi umur minimal akun baru yang boleh masuk server (Menangkal Akun Kloning Scammer).',
-                options: [{ name: 'hari', description: 'Umur minimal akun (dalam hari, contoh: 7)', type: ApplicationCommandOptionType.Integer, required: true }]
+                description: '🤖 Batasi umur minimal akun baru yang boleh masuk server.',
+                options: [{ name: 'hari', description: 'Umur minimal akun (hari)', type: ApplicationCommandOptionType.Integer, required: true }]
             },
             {
                 name: 'server-audit-scan',
-                description: '🔍 Memindai server untuk mendeteksi role berbahaya dengan izin admin berlebih.'
+                description: '🔍 Memindai server untuk mendeteksi role berbahaya dengan hak Admin.'
             },
             {
                 name: 'emergency-mass-unban',
-                description: '🚨 Keadaan Darurat: Membuka semua ban list server dalam sekali klik (Jika salah ban massal).'
+                description: '🚨 Keadaan Darurat: Membuka semua ban list server dalam sekali klik.'
             }
         ]);
-        console.log('📦 [SYSTEM] All Elite Commands Deployed Correctly.');
+        console.log('📦 [SYSTEM] Semua Slash Command Terdeploy Sempurna.');
     } catch (error) {
         console.error('❌ Deployment Command Crash:', error);
     }
 });
 
 // ==========================================
-// 2. DETEKSI OTOMATIS MEMBER BARU (ANTI-ALT ENGINE)
+// 3. MONITOR DETEKSI ANOMALI JOIN (ANTI-RAID & ANTI-ALT)
 // ==========================================
 client.on('guildMemberAdd', async (member) => {
-    const minAgeDays = await db.get(`antialt_${member.guild.id}`) || 0;
-    if (minAgeDays === 0) return;
+    const now = Date.now();
+    const config = await getSettings(member.guild.id);
+    
+    // A. Deteksi Serbuan Raid Massal
+    joinTracker.push(now);
+    const recentJoins = joinTracker.filter(time => now - time < 10000);
+    
+    if (recentJoins.length >= 5) {
+        await sendSecurityAlert(
+            member.guild, 
+            'TERDETEKSI SERANGAN RAID BOT', 
+            `⚠️ **Anomali Masuk Massal:** Ada **${recentJoins.length} akun** masuk bersamaan dalam waktu kurang dari 10 detik.\n\nSistem memperketat pertahanan otomatis.`, 
+            'HIGH'
+        );
+    }
 
-    const accountAgeDays = Math.floor((Date.now() - member.user.createdTimestamp) / (1000 * 60 * 60 * 24));
+    // B. Deteksi Pola Nama Akun Menggunakan Karakter Acak (Bot Generator)
+    const botPattern = /^[a-z0-9]{8,15}$/i; 
+    if (botPattern.test(member.user.username)) {
+        await sendSecurityAlert(
+            member.guild,
+            'AKUN MENCURIGAKAN BERGABUNG',
+            `👤 **User:** ${member.user.tag} (\`${member.user.id}\`)\n⚠️ **Indikasi:** Struktur nama terindikasi sebagai akun kloningan/otomatis.\nSistem menempatkan user ini dalam pengawasan chat ketat.`,
+            'MEDIUM'
+        );
+    }
 
-    if (accountAgeDays < minAgeDays) {
-        try {
-            await member.send(`❌ Akun Anda ditolak masuk ke **${member.guild.name}**. Server ini menerapkan sistem keamanan ketat anti akun kloning (Akun Anda baru berumur ${accountAgeDays} hari, minimal wajib ${minAgeDays} hari).`).catch(() => {});
-            await member.kick('Security Alert: Anti-Alt Account Safeguard Triggered.');
-
-            const alertEmbed = new EmbedBuilder()
-                .setTitle('🚨 Anti-Alt Account Intercepted')
-                .setColor('#FFCC00')
-                .setDescription(`**User Intercepted:** ${member.user.tag} (\`${member.user.id}\`)\n**Umur Akun:** ${accountAgeDays} Hari\n**Batas Minimal:** ${minAgeDays} Hari\n**Tindakan:** Otomatis di-KICK demi keselamatan server.`)
-                .setTimestamp();
-            
-            await sendSecurityLog(member.guild, alertEmbed);
-        } catch (err) {
-            console.error('Gagal memproses anti-alt:', err);
+    // C. Sistem Proteksi Umur Akun (Anti-Alt Cloud)
+    if (config.antialt > 0) {
+        const accountAgeDays = Math.floor((Date.now() - member.user.createdTimestamp) / (1000 * 60 * 60 * 24));
+        if (accountAgeDays < config.antialt) {
+            try {
+                await member.send(`❌ Akses Ditolak: Server **${member.guild.name}** membatasi akun baru. Minimal usia akun adalah ${config.antialt} hari. Akun Anda baru berusia ${accountAgeDays} hari.`).catch(() => {});
+                await member.kick('Security Alert: Anti-Alt Account Shielded.');
+                await sendSecurityAlert(
+                    member.guild, 
+                    'AKUN PADA USIA ANCAMAN DITENDANG', 
+                    `**User:** ${member.user.tag}\n**Usia:** ${accountAgeDays} hari (Batas aman server: ${config.antialt} hari).`, 
+                    'MEDIUM'
+                );
+            } catch {}
         }
     }
 });
 
 // ==========================================
-// 3. ENGINE FILTER VALIDASI PESAN UTAMA
+// 4. CHAT FIREWALL REAL-TIME INTERCEPTOR
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.guild) return;
@@ -166,58 +226,6 @@ client.on('messageCreate', async (message) => {
 
     const guildId = message.guild.id;
     const authorId = message.author.id;
+    const config = await getSettings(guildId);
 
-    // [INTUITIVE ANTI-SPAM INTERCEPTOR]
-    const isAntiSpamOn = await db.get(`antispam_${guildId}`);
-    if (isAntiSpamOn) {
-        const now = Date.now();
-        if (!antiSpamMap.has(authorId)) antiSpamMap.set(authorId, []);
-        const validLogs = antiSpamMap.get(authorId).filter(time => now - time < 4000);
-        validLogs.push(now);
-        antiSpamMap.set(authorId, validLogs);
-
-        if (validLogs.length >= 6) {
-            if (rateLimitBypass.has(authorId)) return;
-            rateLimitBypass.add(authorId);
-            await message.delete().catch(() => {});
-            
-            try {
-                await message.member.timeout(15 * 60 * 1000, 'Security Engine: Rapid Spam Mitigated.');
-                const logEmbed = new EmbedBuilder()
-                    .setTitle('🚨 Automated Anti-Spam Triggered')
-                    .setColor('#FF0055')
-                    .setDescription(`**User:** ${message.author}\n**Tindakan:** Timeout Otomatis 15 Menit.`)
-                    .setTimestamp();
-                await sendSecurityLog(message.guild, logEmbed);
-            } catch {}
-            setTimeout(() => rateLimitBypass.delete(authorId), 10000);
-            return;
-        }
-    }
-
-    // [ANTILINK GLOBAL ENGINE]
-    const isAntiLinkOn = await db.get(`antilink_${guildId}`);
-    if (isAntiLinkOn && /(https?:\/\/[^\s]+)|(discord\.gg\/[^\s]+)/gi.test(message.content)) {
-        await message.delete().catch(() => {});
-        return message.channel.send(`⚠️ **Proteksi:** ${message.author}, dilarang membagikan tautan luar!`).then(msg => setTimeout(() => msg.delete().catch(() => {}), 5000));
-    }
-
-    // [ANTI TOXIC REGEX SYSTEM]
-    const badWords = await db.get(`badwords_${guildId}`) || [];
-    if (badWords.length > 0) {
-        const normalized = message.content.toLowerCase().replace(/[^a-zA-Z0-9\s]/g, '');
-        if (badWords.some(w => normalized.split(/\s+/).includes(w) || normalized.includes(w))) {
-            await message.delete().catch(() => {});
-        }
-    }
-});
-
-// ==========================================
-// 4. INTERACTION & INTERFACE CONTROLLER
-// ==========================================
-client.on('interactionCreate', async (interaction) => {
-    const guildId = interaction.guild?.id;
-
-    // HANDLING VERIFIKASI KLIK TOMBOL (Anti-Bot Panel)
-    if (interaction.isButton() && interaction.customId === 'verify_member') {
-                  
+                                                            
